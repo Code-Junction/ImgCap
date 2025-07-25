@@ -124,13 +124,13 @@ if uploaded_file:
         col1, col2 = st.columns(2)
         
         with col1:
-            st.subheader("� Caption")
+            st.subheader("📝 Caption")
             with st.spinner("Generating description..."):
                 caption = generate_caption(image, captioning_model, processor, tokenizer)
                 st.write(f"**{caption.capitalize()}**")
         
         with col2:
-            st.subheader("� Object Detection")
+            st.subheader("🎯 Object Detection")
             with st.spinner("Detecting objects..."):
                 segmented = perform_segmentation(image, segmentation_model, confidence)
                 st.image(segmented, caption="Detected objects", use_container_width=True)
