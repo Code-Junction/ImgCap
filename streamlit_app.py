@@ -25,7 +25,7 @@ def load_models():
     if torch.cuda.is_available():
         seg_model = seg_model.half().cuda()
     
-    # Captioning model with optimized settings
+    # Captioning model with better quality settings
     cap_model = VisionEncoderDecoderModel.from_pretrained(
         "nlpconnect/vit-gpt2-image-captioning",
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
@@ -33,9 +33,16 @@ def load_models():
     processor = ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
     tokenizer = AutoTokenizer.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
     
-    # Configure tokenizer
+    # Configure tokenizer for better generation
     tokenizer.pad_token = tokenizer.eos_token
     cap_model.config.pad_token_id = tokenizer.eos_token_id
+    cap_model.config.decoder_start_token_id = tokenizer.bos_token_id
+    
+    # Enable better generation settings
+    cap_model.config.max_length = 20
+    cap_model.config.min_length = 5
+    cap_model.config.do_sample = True
+    cap_model.config.temperature = 0.7
     cap_model.eval()
     
     if torch.cuda.is_available():
@@ -122,33 +129,96 @@ def perform_segmentation(image, model, confidence=0.5):
     return img_with_masks
 
 
-def generate_caption(image, model, processor, tokenizer):
-    """Generate caption for image with optimizations"""
+def generate_caption_with_quality(image, model, processor, tokenizer, quality="Balanced"):
+    """Generate caption with adjustable quality settings"""
     try:
-        # Resize image for faster captioning
-        caption_size = (224, 224)
-        resized_image = image.resize(caption_size, Image.Resampling.LANCZOS)
+        # Smart image preprocessing based on quality setting
+        original_size = image.size
         
-        pixel_values = processor(images=[resized_image], return_tensors="pt").pixel_values
+        if quality == "Fast":
+            # Fast mode - smaller image, fewer beams
+            target_size = (224, 224)
+            max_length = 15
+            num_beams = 2
+            do_sample = False
+        elif quality == "High Quality":
+            # High quality - larger image, more beams
+            if max(original_size) > 512:
+                ratio = 512 / max(original_size)
+                target_size = tuple(int(dim * ratio) for dim in original_size)
+            else:
+                target_size = original_size
+            max_length = 25
+            num_beams = 5
+            do_sample = True
+        else:  # Balanced
+            # Balanced mode - moderate settings
+            if max(original_size) > 384:
+                ratio = 384 / max(original_size)
+                target_size = tuple(int(dim * ratio) for dim in original_size)
+            else:
+                target_size = original_size
+            max_length = 20
+            num_beams = 4
+            do_sample = True
+        
+        # Resize image
+        processed_image = image.resize(target_size, Image.Resampling.LANCZOS).convert('RGB')
+        
+        # Process with vision model
+        pixel_values = processor(images=[processed_image], return_tensors="pt").pixel_values
         
         # Move to GPU if available
         if torch.cuda.is_available():
             pixel_values = pixel_values.cuda()
         
+        # Generate caption with quality-specific settings
+        generation_kwargs = {
+            'max_length': max_length,
+            'min_length': 5,
+            'num_beams': num_beams,
+            'do_sample': do_sample,
+            'early_stopping': True,
+            'pad_token_id': tokenizer.pad_token_id,
+            'eos_token_id': tokenizer.eos_token_id,
+            'no_repeat_ngram_size': 2
+        }
+        
+        if do_sample:
+            generation_kwargs.update({
+                'temperature': 0.7,
+                'top_k': 50,
+                'top_p': 0.9
+            })
+        
         with torch.no_grad():
-            generated_ids = model.generate(
-                pixel_values, 
-                max_length=12,  # Reduced from 16 for faster generation
-                do_sample=False,
-                num_beams=3,  # Reduced beam search for speed
-                early_stopping=True,
-                pad_token_id=tokenizer.pad_token_id, 
-                eos_token_id=tokenizer.eos_token_id
-            )
+            generated_ids = model.generate(pixel_values, **generation_kwargs)
+        
         caption = tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
-        return caption.lstrip("a ").lstrip("an ") or "Image analysis completed"
+        
+        # Clean up caption
+        caption = caption.replace("a picture of", "").replace("an image of", "")
+        caption = caption.replace("a photo of", "").replace("a close up of", "")
+        caption = caption.strip()
+        
+        # Ensure caption starts properly
+        if caption and not caption[0].isupper():
+            caption = caption.capitalize()
+        
+        # Add fallback for very short captions
+        if len(caption.split()) < 3:
+            return "Image shows interesting visual content"
+        
+        return caption or "Image analysis completed"
+        
     except Exception as e:
-        return f"Image contains various objects and scenes"
+        print(f"Caption generation error: {e}")
+        return "Unable to generate description for this image"
+
+
+def generate_caption(image, model, processor, tokenizer):
+    """Generate caption for image with optimized quality"""
+    return generate_caption_with_quality(image, model, processor, tokenizer, "Balanced")
 
 
 # --- Streamlit App ---
@@ -170,6 +240,15 @@ if uploaded_file:
     st.sidebar.header("⚙️ Settings")
     confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.5, 
                                    help="Higher values = more confident detections only")
+    
+    # Caption quality settings
+    st.sidebar.subheader("📝 Caption Settings")
+    caption_quality = st.sidebar.selectbox(
+        "Caption Quality", 
+        ["Balanced", "High Quality", "Fast"],
+        index=0,
+        help="Higher quality = better descriptions but slower processing"
+    )
     
     # Image info
     image = Image.open(uploaded_file).convert("RGB")
@@ -199,7 +278,7 @@ if uploaded_file:
             st.subheader("📝 Caption")
             with st.spinner("Generating description..."):
                 caption_start = time.time()
-                caption = generate_caption(image, captioning_model, processor, tokenizer)
+                caption = generate_caption_with_quality(image, captioning_model, processor, tokenizer, caption_quality)
                 caption_time = time.time() - caption_start
                 st.write(f"**{caption.capitalize()}**")
                 st.caption(f"⏱️ Caption generated in {caption_time:.2f}s")
