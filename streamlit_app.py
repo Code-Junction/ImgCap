@@ -7,6 +7,7 @@ import numpy as np
 from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
 import warnings
 import os
+import time
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -15,13 +16,20 @@ os.environ.update({"TRANSFORMERS_VERBOSITY": "error", "TOKENIZERS_PARALLELISM": 
 # --- Model Loading ---
 @st.cache_resource
 def load_models():
-    """Load both segmentation and captioning models"""
-    # Segmentation model
+    """Load both segmentation and captioning models with optimizations"""
+    # Segmentation model with optimized settings
     seg_model = maskrcnn_resnet50_fpn(weights='DEFAULT')
     seg_model.eval()
     
-    # Captioning model
-    cap_model = VisionEncoderDecoderModel.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+    # Set to half precision for faster inference (if supported)
+    if torch.cuda.is_available():
+        seg_model = seg_model.half().cuda()
+    
+    # Captioning model with optimized settings
+    cap_model = VisionEncoderDecoderModel.from_pretrained(
+        "nlpconnect/vit-gpt2-image-captioning",
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+    )
     processor = ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
     tokenizer = AutoTokenizer.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
     
@@ -30,12 +38,15 @@ def load_models():
     cap_model.config.pad_token_id = tokenizer.eos_token_id
     cap_model.eval()
     
+    if torch.cuda.is_available():
+        cap_model = cap_model.cuda()
+    
     return seg_model, cap_model, processor, tokenizer
 
 # --- Core Functions ---
 
 def perform_segmentation(image, model, confidence=0.5):
-    """Perform segmentation and draw masks"""
+    """Perform segmentation and draw masks with optimizations"""
     COCO_CLASSES = ['__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
         'train', 'truck', 'boat', 'traffic light', 'fire hydrant','stop sign',
         'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
@@ -49,51 +60,95 @@ def perform_segmentation(image, model, confidence=0.5):
         'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'spectacles', 'book',
         'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush']
 
+    # Optimize image size for faster processing
+    original_size = image.size
+    max_size = 800  # Reduce from default for faster processing
+    if max(original_size) > max_size:
+        ratio = max_size / max(original_size)
+        new_size = tuple(int(dim * ratio) for dim in original_size)
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+    
     transform = T.Compose([T.ToTensor()])
     img_tensor = transform(image)
+    
+    # Move to GPU if available
+    if torch.cuda.is_available():
+        img_tensor = img_tensor.cuda().half()
 
     with torch.no_grad():
         prediction = model([img_tensor])
 
+    # Move results back to CPU for processing
+    if torch.cuda.is_available():
+        scores = prediction[0]['scores'].cpu()
+        masks = prediction[0]['masks'].cpu()
+        labels = prediction[0]['labels'].cpu()
+    else:
+        scores, masks, labels = prediction[0]['scores'], prediction[0]['masks'], prediction[0]['labels']
+
     img_with_masks = image.copy()
-    scores, masks, labels = prediction[0]['scores'], prediction[0]['masks'], prediction[0]['labels']
-
-    for i, score in enumerate(scores):
-        if score > confidence:
-            mask = masks[i, 0].mul(255).byte().cpu().numpy()
-            label = COCO_CLASSES[labels[i]]
-            color = np.random.randint(0, 255, size=3)
+    
+    # Optimize: Only process top N detections for speed
+    top_n = 10
+    top_indices = torch.argsort(scores, descending=True)[:top_n]
+    
+    for idx in top_indices:
+        i = idx.item()
+        if i >= len(scores) or scores[i] <= confidence:
+            continue
             
-            mask_indices = mask > 128
-            if np.any(mask_indices):
-                img_array = np.array(img_with_masks)
-                overlay = np.zeros_like(img_array)
-                overlay[mask_indices] = color
-                img_array[mask_indices] = (img_array[mask_indices] * 0.7 + overlay[mask_indices] * 0.3).astype(np.uint8)
-                img_with_masks = Image.fromarray(img_array)
-                
-                y_coords, x_coords = np.where(mask_indices)
-                if len(y_coords) > 0:
-                    text_pos = (int(np.min(x_coords)), max(0, int(np.min(y_coords)) - 10))
-                    draw = ImageDraw.Draw(img_with_masks)
-                    draw.text(text_pos, label, fill="white", stroke_width=1, stroke_fill="black")
+        mask = masks[i, 0].mul(255).byte().numpy()
+        label = COCO_CLASSES[labels[i]]
+        color = np.random.randint(0, 255, size=3)
+        
+        mask_indices = mask > 128
+        if np.any(mask_indices):
+            img_array = np.array(img_with_masks)
+            overlay = np.zeros_like(img_array)
+            overlay[mask_indices] = color
+            img_array[mask_indices] = (img_array[mask_indices] * 0.7 + overlay[mask_indices] * 0.3).astype(np.uint8)
+            img_with_masks = Image.fromarray(img_array)
+            
+            y_coords, x_coords = np.where(mask_indices)
+            if len(y_coords) > 0:
+                text_pos = (int(np.min(x_coords)), max(0, int(np.min(y_coords)) - 10))
+                draw = ImageDraw.Draw(img_with_masks)
+                draw.text(text_pos, label, fill="white", stroke_width=2, stroke_fill="black")
 
+    # Resize back to original size if it was resized
+    if max(original_size) > max_size:
+        img_with_masks = img_with_masks.resize(original_size, Image.Resampling.LANCZOS)
+    
     return img_with_masks
 
 
 def generate_caption(image, model, processor, tokenizer):
-    """Generate caption for image"""
+    """Generate caption for image with optimizations"""
     try:
-        pixel_values = processor(images=[image], return_tensors="pt").pixel_values
+        # Resize image for faster captioning
+        caption_size = (224, 224)
+        resized_image = image.resize(caption_size, Image.Resampling.LANCZOS)
+        
+        pixel_values = processor(images=[resized_image], return_tensors="pt").pixel_values
+        
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            pixel_values = pixel_values.cuda()
+        
         with torch.no_grad():
             generated_ids = model.generate(
-                pixel_values, max_length=16, do_sample=False,
-                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id
+                pixel_values, 
+                max_length=12,  # Reduced from 16 for faster generation
+                do_sample=False,
+                num_beams=3,  # Reduced beam search for speed
+                early_stopping=True,
+                pad_token_id=tokenizer.pad_token_id, 
+                eos_token_id=tokenizer.eos_token_id
             )
         caption = tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
         return caption.lstrip("a ").lstrip("an ") or "Image analysis completed"
-    except:
-        return "Image contains various objects and scenes"
+    except Exception as e:
+        return f"Image contains various objects and scenes"
 
 
 # --- Streamlit App ---
@@ -112,25 +167,68 @@ uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png
 
 if uploaded_file:
     # Settings
-    confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.5)
+    st.sidebar.header("⚙️ Settings")
+    confidence = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.5, 
+                                   help="Higher values = more confident detections only")
+    
+    # Image info
+    image = Image.open(uploaded_file).convert("RGB")
+    st.sidebar.header("📊 Image Info")
+    st.sidebar.write(f"**Size:** {image.size[0]} x {image.size[1]} px")
+    st.sidebar.write(f"**Format:** {uploaded_file.type}")
+    st.sidebar.write(f"**File Size:** {len(uploaded_file.getvalue()) / 1024:.1f} KB")
+    
+    # Performance tips
+    if max(image.size) > 1200:
+        st.sidebar.warning("⚠️ Large image detected. Processing may take longer.")
+    elif max(image.size) < 300:
+        st.sidebar.info("ℹ️ Small image. Consider higher resolution for better detection.")
     
     # Load and display image
-    image = Image.open(uploaded_file).convert("RGB")
     st.subheader("Original Image")
     st.image(image, use_container_width=True)
     
     # Analyze button
     if st.button("🔍 Analyze Image", use_container_width=True):
+        # Performance tracking
+        start_time = time.time()
+        
         col1, col2 = st.columns(2)
         
         with col1:
             st.subheader("📝 Caption")
             with st.spinner("Generating description..."):
+                caption_start = time.time()
                 caption = generate_caption(image, captioning_model, processor, tokenizer)
+                caption_time = time.time() - caption_start
                 st.write(f"**{caption.capitalize()}**")
+                st.caption(f"⏱️ Caption generated in {caption_time:.2f}s")
         
         with col2:
             st.subheader("🎯 Object Detection")
             with st.spinner("Detecting objects..."):
+                detection_start = time.time()
                 segmented = perform_segmentation(image, segmentation_model, confidence)
+                detection_time = time.time() - detection_start
                 st.image(segmented, caption="Detected objects", use_container_width=True)
+                st.caption(f"⏱️ Detection completed in {detection_time:.2f}s")
+        
+        # Total processing time
+        total_time = time.time() - start_time
+        st.success(f"🚀 **Total processing time: {total_time:.2f} seconds**")
+        
+        # Performance tips
+        with st.expander("💡 Performance Info"):
+            st.write(f"""
+            **Processing Statistics:**
+            - Image Caption: {caption_time:.2f}s
+            - Object Detection: {detection_time:.2f}s
+            - Total Time: {total_time:.2f}s
+            - GPU Acceleration: {'✅ Enabled' if torch.cuda.is_available() else '❌ CPU Only'}
+            - Image Size: {image.size[0]} x {image.size[1]} pixels
+            """)
+            
+            if torch.cuda.is_available():
+                st.write("🔥 **GPU acceleration is active** for faster processing!")
+            else:
+                st.write("💻 Running on CPU. Consider GPU for 3-5x faster processing.")
